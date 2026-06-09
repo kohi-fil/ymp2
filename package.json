@@ -1,14 +1,15 @@
 {
   "name": "yt-mp3-downloader",
   "version": "1.0.0",
-  "description": "YouTube to MP3 downloader using yt-dlp",
+  "description": "YouTube to MP3 downloader using youtubei.js",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ffmpeg-static": "*"
+    "youtubei.js": "latest"
   },
   "optionalDependencies": {
     "ffmpeg-static": "*"
