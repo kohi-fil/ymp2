@@ -54,6 +54,25 @@ async function resolveFfmpeg() {
   catch { return 'ffmpeg'; }
 }
 
+// ── Cookies ───────────────────────────────────────────────────────────────────
+// Load cookies from COOKIES_PATH env var (a Netscape-format .txt file on disk),
+// or fall back to the COOKIES env var (raw file contents as a string).
+// If neither is set, yt-dlp runs without cookies (may hit bot-check on some IPs).
+function resolveCookiesPath() {
+  if (process.env.COOKIES_PATH && fs.existsSync(process.env.COOKIES_PATH)) {
+    console.log('🍪 Using cookies file:', process.env.COOKIES_PATH);
+    return process.env.COOKIES_PATH;
+  }
+  if (process.env.COOKIES) {
+    const dest = path.join(os.tmpdir(), 'yt-cookies.txt');
+    fs.writeFileSync(dest, process.env.COOKIES, 'utf8');
+    console.log('🍪 Wrote cookies from env to', dest);
+    return dest;
+  }
+  console.warn('⚠️  No cookies configured — bot-check may block requests on datacenter IPs.');
+  return null;
+}
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -75,6 +94,12 @@ function safeFilename(title) {
 
 function cleanup(p) { if (p) fs.unlink(p, () => {}); }
 
+// Append --cookies <path> to an args array when cookies are available.
+function withCookies(args) {
+  if (app.locals.cookiesPath) return [...args, '--cookies', app.locals.cookiesPath];
+  return args;
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -87,12 +112,12 @@ app.get('/info', async (req, res) => {
   try {
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    const raw = await ytdlp.execPromise([
+    const raw = await ytdlp.execPromise(withCookies([
       url,
       '--dump-json',
       '--no-playlist',
       '--extractor-args', 'youtube:player_client=tv',
-    ]);
+    ]));
 
     const info = JSON.parse(raw);
     res.json({
@@ -119,19 +144,19 @@ app.get('/download', async (req, res) => {
   try {
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    // 1. Get title for the filename (--print is lightweight, no full dump-json)
-    const title = (await ytdlp.execPromise([
+    // 1. Get title for the filename
+    const title = (await ytdlp.execPromise(withCookies([
       url,
       '--print', 'title',
       '--no-playlist',
       '--extractor-args', 'youtube:player_client=tv',
-    ])).trim();
+    ]))).trim();
 
     const filename = safeFilename(title || id);
     console.log(`[download] start "${filename}"`);
 
-    // 2. Download + convert — TV client avoids bot-check on datacenter IPs
-    await ytdlp.execPromise([
+    // 2. Download + convert
+    await ytdlp.execPromise(withCookies([
       url,
       '-x',
       '--audio-format',    'mp3',
@@ -140,7 +165,7 @@ app.get('/download', async (req, res) => {
       '--no-playlist',
       '--extractor-args',  'youtube:player_client=tv',
       '-o', path.join(os.tmpdir(), `${id}.%(ext)s`),
-    ]);
+    ]));
 
     if (!fs.existsSync(mp3Path))
       return res.status(500).json({ error: 'Conversion produced no output file.' });
@@ -169,8 +194,9 @@ app.get('/download', async (req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
-  app.locals.ffmpegPath = await resolveFfmpeg();
-  app.locals.ytdlpPath  = await ensureYtDlp();
+  app.locals.ffmpegPath  = await resolveFfmpeg();
+  app.locals.ytdlpPath   = await ensureYtDlp();
+  app.locals.cookiesPath = resolveCookiesPath();
   console.log('ffmpeg:', app.locals.ffmpegPath);
   console.log('yt-dlp:', app.locals.ytdlpPath);
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
