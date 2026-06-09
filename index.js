@@ -13,8 +13,8 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── yt-dlp binary ─────────────────────────────────────────────────────────────
-const BIN_DIR    = path.join(__dirname, 'bin');
-const YTDLP_PATH = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const BIN_DIR     = path.join(__dirname, 'bin');
+const YTDLP_PATH  = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
 // Download yt-dlp directly from GitHub releases, following redirects.
 function downloadFile(url, dest) {
@@ -103,7 +103,17 @@ app.get('/info', async (req, res) => {
 
   try {
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
-    const info  = await ytdlp.getVideoInfo(url);
+
+    // Use iOS client to bypass YouTube bot-check on datacenter IPs.
+    // getVideoInfo() passes `-f best` which triggers a warning and can fail;
+    // call execPromise directly with --dump-json instead.
+    const raw = await ytdlp.execPromise([
+      url,
+      '--dump-json',
+      '--no-playlist',
+      '--extractor-args', 'youtube:player_client=ios',
+    ]);
+    const info = JSON.parse(raw);
 
     const thumb = (info.thumbnails || [])
       .sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)))[0]
@@ -154,6 +164,7 @@ app.get('/download', async (req, res) => {
       '--audio-quality', '0',
       '--ffmpeg-location', path.dirname(app.locals.ffmpegPath),
       '--no-playlist',
+      '--extractor-args', 'youtube:player_client=ios',
       '-o', path.join(os.tmpdir(), `${id}.%(ext)s`),
     ]);
 
