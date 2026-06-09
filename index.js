@@ -4,6 +4,7 @@ import fs      from 'fs';
 import os      from 'os';
 import { fileURLToPath } from 'url';
 import { Innertube }     from 'youtubei.js';
+import { generate }      from 'youtube-po-token-generator';
 import { spawn }         from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -21,10 +22,51 @@ async function resolveFfmpeg() {
   }
 }
 
-// ── youtubei.js client (created once at startup) ──────────────────────────────
+// ── PoToken management ────────────────────────────────────────────────────────
+// YouTube requires a valid poToken + visitorData pair to serve streams from
+// server-side (non-browser) environments. Without it many videos return
+// "Video is login required". Tokens expire roughly every 6 hours so we
+// refresh them periodically in the background.
+let tokenCache = { visitorData: null, poToken: null, expiresAt: 0 };
+const TOKEN_TTL_MS = 5 * 60 * 60 * 1000; // 5 hours
+
+async function getPoTokens() {
+  if (Date.now() < tokenCache.expiresAt) return tokenCache;
+  try {
+    console.log('[potoken] generating fresh tokens…');
+    const result = await generate();
+    tokenCache = {
+      visitorData: result.visitorData,
+      poToken:     result.poToken,
+      expiresAt:   Date.now() + TOKEN_TTL_MS,
+    };
+    console.log('[potoken] tokens ready, visitor_data prefix:', result.visitorData?.slice(0, 12));
+  } catch (e) {
+    console.error('[potoken] generation failed, continuing without tokens:', e.message);
+    // Return whatever we have (possibly null values); ytjs will still try.
+  }
+  return tokenCache;
+}
+
+// ── youtubei.js client ────────────────────────────────────────────────────────
+// We recreate the client whenever tokens are refreshed so the new tokens
+// are picked up. A simple "dirty" flag keeps it cheap.
 let yt = null;
+let ytTokensExpiry = 0;
+
 async function getYT() {
-  if (!yt) yt = await Innertube.create({ retrieve_player: true });
+  if (yt && Date.now() < ytTokensExpiry) return yt;
+
+  const { visitorData, poToken, expiresAt } = await getPoTokens();
+
+  yt = await Innertube.create({
+    retrieve_player:         true,
+    generate_session_locally: true,   // faster startup; avoids extra YT request
+    ...(visitorData && { visitor_data: visitorData }),
+    ...(poToken     && { po_token:     poToken     }),
+  });
+
+  ytTokensExpiry = expiresAt;
   return yt;
 }
 
@@ -42,7 +84,7 @@ function isYouTubeUrl(url) {
 function extractVideoId(url) {
   try {
     const u = new URL(url);
-    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1);
+    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split('?')[0];
     return u.searchParams.get('v');
   } catch { return null; }
 }
@@ -83,18 +125,22 @@ app.get('/info', async (req, res) => {
 
   try {
     const youtube = await getYT();
-    const info    = await youtube.getBasicInfo(videoId);
+    const info    = await youtube.getBasicInfo(videoId, 'ANDROID');
     const details = info.basic_info;
 
-    res.json({
-      title:           details.title                || '',
-      thumbnail:       details.thumbnail?.[0]?.url  || '',
+    // Pick the best thumbnail (highest res first)
+    const thumbs = details.thumbnail || [];
+    const thumb  = thumbs.sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || '';
+
+    return res.json({
+      title:           details.title                 || '',
+      thumbnail:       thumb,
       duration_string: formatDuration(details.duration),
-      uploader:        details.author               || '',
+      uploader:        details.author                || '',
     });
   } catch (e) {
     console.error('[info error]', e.message);
-    res.status(400).json({ error: e.message || 'Could not fetch video info.' });
+    return res.status(400).json({ error: e.message || 'Could not fetch video info.' });
   }
 });
 
@@ -108,9 +154,9 @@ app.get('/download', async (req, res) => {
   if (!videoId)
     return res.status(400).json({ error: 'Could not extract video ID from URL.' });
 
-  const id      = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const rawPath = path.join(os.tmpdir(), `${id}.webm`);
-  const mp3Path = path.join(os.tmpdir(), `${id}.mp3`);
+  const id       = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const rawPath  = path.join(os.tmpdir(), `${id}.webm`);
+  const mp3Path  = path.join(os.tmpdir(), `${id}.mp3`);
   const filename = safeFilename(title || id);
 
   console.log(`[download] start "${filename}"`);
@@ -118,19 +164,26 @@ app.get('/download', async (req, res) => {
   try {
     const youtube = await getYT();
 
-    // Stream best audio-only format directly from YouTube's InnerTube API
+    // Use ANDROID client — it bypasses most login/bot-check restrictions
+    // and reliably returns non-DRM audio streams.
     const stream = await youtube.download(videoId, {
       type:    'audio',
       quality: 'best',
       format:  'any',
+      client:  'ANDROID',
     });
 
     await new Promise((resolve, reject) => {
       const file = fs.createWriteStream(rawPath);
-      stream.pipe(file);
+      // youtubei.js returns a web ReadableStream; pipe via async iteration
+      (async () => {
+        try {
+          for await (const chunk of stream) file.write(chunk);
+          file.end();
+        } catch (err) { reject(err); }
+      })();
       file.on('finish', resolve);
       file.on('error', reject);
-      stream.on('error', reject);
     });
 
     // Convert webm/opus → mp3 via ffmpeg
@@ -186,7 +239,7 @@ async function start() {
   console.log('☕  Starting yt-mp3…');
   console.log('ffmpeg:', app.locals.ffmpegPath);
 
-  await getYT(); // warm up InnerTube session before accepting requests
+  await getYT(); // warm up InnerTube session + generate initial poTokens
   console.log('✅ youtubei.js ready');
 
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
