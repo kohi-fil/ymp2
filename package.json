@@ -4,18 +4,11 @@
   "description": "YouTube to MP3 downloader using yt-dlp",
   "main": "index.js",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "express": "^4.19.2",
-    "yt-dlp-wrap": "^2.3.12",
-    "youtube-po-token-generator": "latest"
+    "yt-dlp-wrap": "^2.3.12"
   },
-  "optionalDependencies": {
-    "ffmpeg-static": "*"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "optionalDependencies": { "ffmpeg-static": "*" },
+  "engines": { "node": ">=18.0.0" }
 }
