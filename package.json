@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "youtubei.js": "latest"
+    "youtubei.js": "latest",
+    "youtube-po-token-generator": "latest"
   },
   "optionalDependencies": {
     "ffmpeg-static": "*"
