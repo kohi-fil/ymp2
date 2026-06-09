@@ -21,21 +21,21 @@ async function resolveFfmpeg() {
 }
 
 // ── youtubei.js client ────────────────────────────────────────────────────────
-// We use the ANDROID InnerTube client throughout.
-// Unlike the WEB client, ANDROID does not require poTokens and is not
-// subject to the "login required" bot-check gate on server IPs.
-// A single shared instance is fine — it is stateless across requests.
+// Use the ANDROID InnerTube client. It does not require poTokens and is not
+// subject to the "login required" / bot-check gate on server IPs.
+//
+// IMPORTANT: as of youtubei.js v11+ the second arg to getBasicInfo/getInfo
+// changed from a plain string to an options object: { client: 'ANDROID' }.
+// Passing a bare string silently falls back to the WEB client (which hits the
+// login-required wall on datacenter IPs), so every call must use the object form.
 let yt = null;
-let ytReady = false;
 
 async function getYT() {
-  if (ytReady) return yt;
+  if (yt) return yt;
   yt = await Innertube.create({
     retrieve_player:          true,
-    generate_session_locally: true, // skip the extra YT page request at startup
-    client_type:              'ANDROID',
+    generate_session_locally: true,
   });
-  ytReady = true;
   return yt;
 }
 
@@ -94,7 +94,8 @@ app.get('/info', async (req, res) => {
 
   try {
     const youtube = await getYT();
-    const info    = await youtube.getBasicInfo(videoId, 'ANDROID');
+    // Object form required in youtubei.js v11+
+    const info    = await youtube.getBasicInfo(videoId, { client: 'ANDROID' });
     const details = info.basic_info;
 
     const thumbs = details.thumbnail || [];
@@ -132,6 +133,7 @@ app.get('/download', async (req, res) => {
   try {
     const youtube = await getYT();
 
+    // client must be in the options object (not a bare string) for v11+
     const stream = await youtube.download(videoId, {
       type:    'audio',
       quality: 'best',
@@ -139,7 +141,7 @@ app.get('/download', async (req, res) => {
       client:  'ANDROID',
     });
 
-    // youtubei.js returns a web ReadableStream — iterate with for-await
+    // youtubei.js returns a web ReadableStream — use for-await, not .pipe()
     await new Promise((resolve, reject) => {
       const file = fs.createWriteStream(rawPath);
       (async () => {
@@ -202,12 +204,11 @@ async function start() {
   console.log('☕  Starting yt-mp3…');
   console.log('ffmpeg:', app.locals.ffmpegPath);
 
-  // Listen first so Render sees the open port immediately, then warm up in background.
+  // Bind port first so Render sees it immediately, warm up in background
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
 
-  // Warm up the InnerTube session in the background — first request won't have to wait.
   getYT()
-    .then(() => console.log('✅ youtubei.js ready (ANDROID client)'))
+    .then(() => console.log('✅ youtubei.js ready'))
     .catch((err) => console.error('⚠️  youtubei.js warm-up failed:', err.message));
 }
 
