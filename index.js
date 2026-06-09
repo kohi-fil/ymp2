@@ -4,7 +4,6 @@ import fs      from 'fs';
 import os      from 'os';
 import { fileURLToPath } from 'url';
 import { Innertube }     from 'youtubei.js';
-import { generate }      from 'youtube-po-token-generator';
 import { spawn }         from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,61 +11,31 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── ffmpeg path ───────────────────────────────────────────────────────────────
-// Render has ffmpeg natively; ffmpeg-static is optional for local dev.
 async function resolveFfmpeg() {
   try {
     const mod = await import('ffmpeg-static');
     return mod.default;
   } catch {
-    return 'ffmpeg'; // system ffmpeg (available on Render)
+    return 'ffmpeg';
   }
-}
-
-// ── PoToken management ────────────────────────────────────────────────────────
-// YouTube requires a valid poToken + visitorData pair to serve streams from
-// server-side (non-browser) environments. Without it many videos return
-// "Video is login required". Tokens expire roughly every 6 hours so we
-// refresh them periodically in the background.
-let tokenCache = { visitorData: null, poToken: null, expiresAt: 0 };
-const TOKEN_TTL_MS = 5 * 60 * 60 * 1000; // 5 hours
-
-async function getPoTokens() {
-  if (Date.now() < tokenCache.expiresAt) return tokenCache;
-  try {
-    console.log('[potoken] generating fresh tokens…');
-    const result = await generate();
-    tokenCache = {
-      visitorData: result.visitorData,
-      poToken:     result.poToken,
-      expiresAt:   Date.now() + TOKEN_TTL_MS,
-    };
-    console.log('[potoken] tokens ready, visitor_data prefix:', result.visitorData?.slice(0, 12));
-  } catch (e) {
-    console.error('[potoken] generation failed, continuing without tokens:', e.message);
-    // Return whatever we have (possibly null values); ytjs will still try.
-  }
-  return tokenCache;
 }
 
 // ── youtubei.js client ────────────────────────────────────────────────────────
-// We recreate the client whenever tokens are refreshed so the new tokens
-// are picked up. A simple "dirty" flag keeps it cheap.
+// We use the ANDROID InnerTube client throughout.
+// Unlike the WEB client, ANDROID does not require poTokens and is not
+// subject to the "login required" bot-check gate on server IPs.
+// A single shared instance is fine — it is stateless across requests.
 let yt = null;
-let ytTokensExpiry = 0;
+let ytReady = false;
 
 async function getYT() {
-  if (yt && Date.now() < ytTokensExpiry) return yt;
-
-  const { visitorData, poToken, expiresAt } = await getPoTokens();
-
+  if (ytReady) return yt;
   yt = await Innertube.create({
-    retrieve_player:         true,
-    generate_session_locally: true,   // faster startup; avoids extra YT request
-    ...(visitorData && { visitor_data: visitorData }),
-    ...(poToken     && { po_token:     poToken     }),
+    retrieve_player:          true,
+    generate_session_locally: true, // skip the extra YT page request at startup
+    client_type:              'ANDROID',
   });
-
-  ytTokensExpiry = expiresAt;
+  ytReady = true;
   return yt;
 }
 
@@ -128,15 +97,14 @@ app.get('/info', async (req, res) => {
     const info    = await youtube.getBasicInfo(videoId, 'ANDROID');
     const details = info.basic_info;
 
-    // Pick the best thumbnail (highest res first)
     const thumbs = details.thumbnail || [];
     const thumb  = thumbs.sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || '';
 
     return res.json({
-      title:           details.title                 || '',
+      title:           details.title  || '',
       thumbnail:       thumb,
       duration_string: formatDuration(details.duration),
-      uploader:        details.author                || '',
+      uploader:        details.author || '',
     });
   } catch (e) {
     console.error('[info error]', e.message);
@@ -164,8 +132,6 @@ app.get('/download', async (req, res) => {
   try {
     const youtube = await getYT();
 
-    // Use ANDROID client — it bypasses most login/bot-check restrictions
-    // and reliably returns non-DRM audio streams.
     const stream = await youtube.download(videoId, {
       type:    'audio',
       quality: 'best',
@@ -173,14 +139,14 @@ app.get('/download', async (req, res) => {
       client:  'ANDROID',
     });
 
+    // youtubei.js returns a web ReadableStream — iterate with for-await
     await new Promise((resolve, reject) => {
       const file = fs.createWriteStream(rawPath);
-      // youtubei.js returns a web ReadableStream; pipe via async iteration
       (async () => {
         try {
           for await (const chunk of stream) file.write(chunk);
           file.end();
-        } catch (err) { reject(err); }
+        } catch (err) { file.destroy(err); }
       })();
       file.on('finish', resolve);
       file.on('error', reject);
@@ -191,7 +157,7 @@ app.get('/download', async (req, res) => {
       const proc = spawn(app.locals.ffmpegPath, [
         '-y', '-i', rawPath,
         '-vn', '-acodec', 'libmp3lame', '-q:a', '0',
-        mp3Path
+        mp3Path,
       ]);
       let stderr = '';
       proc.stderr.on('data', (d) => (stderr += d));
@@ -219,10 +185,7 @@ app.get('/download', async (req, res) => {
     const done = () => { if (!cleaned) { cleaned = true; cleanup(mp3Path); } };
     res.on('finish', done);
     res.on('close',  done);
-    fileStream.on('error', (err) => {
-      console.error('[stream error]', err.message);
-      cleanup(mp3Path);
-    });
+    fileStream.on('error', (err) => { console.error('[stream error]', err.message); cleanup(mp3Path); });
 
     console.log(`[download] serving "${filename}" (${(stat.size / 1e6).toFixed(1)} MB)`);
   } catch (e) {
@@ -239,10 +202,13 @@ async function start() {
   console.log('☕  Starting yt-mp3…');
   console.log('ffmpeg:', app.locals.ffmpegPath);
 
-  await getYT(); // warm up InnerTube session + generate initial poTokens
-  console.log('✅ youtubei.js ready');
-
+  // Listen first so Render sees the open port immediately, then warm up in background.
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
+
+  // Warm up the InnerTube session in the background — first request won't have to wait.
+  getYT()
+    .then(() => console.log('✅ youtubei.js ready (ANDROID client)'))
+    .catch((err) => console.error('⚠️  youtubei.js warm-up failed:', err.message));
 }
 
 start().catch((err) => {
