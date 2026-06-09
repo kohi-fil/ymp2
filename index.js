@@ -6,7 +6,6 @@ import https   from 'https';
 import { fileURLToPath } from 'url';
 import YTDlpWrapModule from 'yt-dlp-wrap';
 const YTDlpWrap = YTDlpWrapModule.default ?? YTDlpWrapModule;
-import { generate as generatePoToken } from 'youtube-po-token-generator';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -34,10 +33,7 @@ function downloadFile(url, dest) {
 }
 
 async function ensureYtDlp() {
-  if (fs.existsSync(YTDLP_PATH)) {
-    console.log('yt-dlp binary already present at', YTDLP_PATH);
-    return YTDLP_PATH;
-  }
+  if (fs.existsSync(YTDLP_PATH)) return YTDLP_PATH;
   fs.mkdirSync(BIN_DIR, { recursive: true });
   console.log('Downloading yt-dlp binary…');
   const asset = process.platform === 'win32' ? 'yt-dlp.exe'
@@ -52,32 +48,10 @@ async function ensureYtDlp() {
   return YTDLP_PATH;
 }
 
-// ── PO Token ──────────────────────────────────────────────────────────────────
-// youtube-po-token-generator generates a fresh visitorData + poToken pair by
-// running YouTube's own BotGuard script via jsdom — no cookies or login needed.
-// We cache for 5 minutes to avoid a network round-trip on every request.
-let poTokenCache  = null;
-let poTokenExpiry = 0;
-
-async function getPoToken() {
-  const now = Date.now();
-  if (poTokenCache && now < poTokenExpiry) return poTokenCache;
-  console.log('[potoken] generating fresh token…');
-  const result = await generatePoToken();
-  poTokenCache  = result;
-  poTokenExpiry = now + 5 * 60 * 1000;
-  console.log('[potoken] ready');
-  return result;
-}
-
 // ── ffmpeg path ───────────────────────────────────────────────────────────────
 async function resolveFfmpeg() {
-  try {
-    const mod = await import('ffmpeg-static');
-    return mod.default;
-  } catch {
-    return 'ffmpeg';
-  }
+  try { const mod = await import('ffmpeg-static'); return mod.default; }
+  catch { return 'ffmpeg'; }
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
@@ -99,74 +73,35 @@ function safeFilename(title) {
     .concat('.mp3');
 }
 
-function cleanup(filePath) {
-  if (filePath) fs.unlink(filePath, () => {});
-}
+function cleanup(p) { if (p) fs.unlink(p, () => {}); }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// GET /info?url=...
-app.get('/info', async (req, res) => {
+// GET /download?url=...
+app.get('/download', async (req, res) => {
   const { url } = req.query;
   if (!url || !isYouTubeUrl(url))
     return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
 
+  const id      = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const mp3Path = path.join(os.tmpdir(), `${id}.mp3`);
+
   try {
-    const { visitorData, poToken } = await getPoToken();
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    const raw = await ytdlp.execPromise([
+    // 1. Get title for the filename (--print is lightweight, no full dump-json)
+    const title = (await ytdlp.execPromise([
       url,
-      '--dump-json',
+      '--print', 'title',
       '--no-playlist',
-      '--extractor-args', `youtube:player_client=web;po_token=web.player+${poToken};visitor_data=${visitorData}`,
-    ]);
-    const info = JSON.parse(raw);
+      '--extractor-args', 'youtube:player_client=tv',
+    ])).trim();
 
-    const thumb = (info.thumbnails || [])
-      .sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)))[0]
-      ?.url || info.thumbnail || '';
+    const filename = safeFilename(title || id);
+    console.log(`[download] start "${filename}"`);
 
-    const duration = info.duration
-      ? (() => {
-          const s   = Math.round(info.duration);
-          const h   = Math.floor(s / 3600);
-          const m   = Math.floor((s % 3600) / 60);
-          const sec = s % 60;
-          if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
-          return `${m}:${String(sec).padStart(2,'0')}`;
-        })()
-      : '';
-
-    return res.json({
-      title:           info.title    || '',
-      thumbnail:       thumb,
-      duration_string: duration,
-      uploader:        info.uploader || info.channel || '',
-    });
-  } catch (e) {
-    console.error('[info error]', e.message);
-    return res.status(400).json({ error: e.message || 'Could not fetch video info.' });
-  }
-});
-
-// GET /download?url=...&title=...
-app.get('/download', async (req, res) => {
-  const { url, title } = req.query;
-  if (!url || !isYouTubeUrl(url))
-    return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
-
-  const id       = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const mp3Path  = path.join(os.tmpdir(), `${id}.mp3`);
-  const filename = safeFilename(title || id);
-
-  console.log(`[download] start "${filename}"`);
-
-  try {
-    const { visitorData, poToken } = await getPoToken();
-    const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
-
+    // 2. Download + convert — TV client avoids bot-check on datacenter IPs
     await ytdlp.execPromise([
       url,
       '-x',
@@ -174,7 +109,7 @@ app.get('/download', async (req, res) => {
       '--audio-quality',   '0',
       '--ffmpeg-location', path.dirname(app.locals.ffmpegPath),
       '--no-playlist',
-      '--extractor-args', `youtube:player_client=web;po_token=web.player+${poToken};visitor_data=${visitorData}`,
+      '--extractor-args',  'youtube:player_client=tv',
       '-o', path.join(os.tmpdir(), `${id}.%(ext)s`),
     ]);
 
@@ -186,14 +121,14 @@ app.get('/download', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length',      stat.size);
 
-    const fileStream = fs.createReadStream(mp3Path);
-    fileStream.pipe(res);
+    const stream = fs.createReadStream(mp3Path);
+    stream.pipe(res);
 
     let cleaned = false;
     const done = () => { if (!cleaned) { cleaned = true; cleanup(mp3Path); } };
     res.on('finish', done);
     res.on('close',  done);
-    fileStream.on('error', (err) => { console.error('[stream error]', err.message); cleanup(mp3Path); });
+    stream.on('error', (err) => { console.error('[stream error]', err.message); cleanup(mp3Path); });
 
     console.log(`[download] serving "${filename}" (${(stat.size / 1e6).toFixed(1)} MB)`);
   } catch (e) {
@@ -207,14 +142,9 @@ app.get('/download', async (req, res) => {
 async function start() {
   app.locals.ffmpegPath = await resolveFfmpeg();
   app.locals.ytdlpPath  = await ensureYtDlp();
-
   console.log('ffmpeg:', app.locals.ffmpegPath);
   console.log('yt-dlp:', app.locals.ytdlpPath);
-
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
 }
 
-start().catch((err) => {
-  console.error('Startup failed:', err);
-  process.exit(1);
-});
+start().catch((err) => { console.error('Startup failed:', err); process.exit(1); });
