@@ -2,13 +2,33 @@ import express from 'express';
 import path    from 'path';
 import fs      from 'fs';
 import os      from 'os';
+import https   from 'https';
 import { fileURLToPath } from 'url';
-import { Innertube }     from 'youtubei.js';
 import { spawn }         from 'child_process';
+import YTDlpWrap         from 'yt-dlp-wrap';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ── yt-dlp binary ─────────────────────────────────────────────────────────────
+// Auto-download the yt-dlp binary into bin/ on first start (Linux/macOS).
+// On Windows, yt-dlp-wrap falls back to the system PATH automatically.
+const BIN_DIR     = path.join(__dirname, 'bin');
+const YTDLP_PATH  = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+
+async function ensureYtDlp() {
+  if (fs.existsSync(YTDLP_PATH)) {
+    console.log('yt-dlp binary already present at', YTDLP_PATH);
+    return YTDLP_PATH;
+  }
+  fs.mkdirSync(BIN_DIR, { recursive: true });
+  console.log('Downloading yt-dlp binary…');
+  await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
+  fs.chmodSync(YTDLP_PATH, 0o755);
+  console.log('✅ yt-dlp downloaded to', YTDLP_PATH);
+  return YTDLP_PATH;
+}
 
 // ── ffmpeg path ───────────────────────────────────────────────────────────────
 async function resolveFfmpeg() {
@@ -20,25 +40,6 @@ async function resolveFfmpeg() {
   }
 }
 
-// ── youtubei.js client ────────────────────────────────────────────────────────
-// Use the ANDROID InnerTube client. It does not require poTokens and is not
-// subject to the "login required" / bot-check gate on server IPs.
-//
-// IMPORTANT: as of youtubei.js v11+ the second arg to getBasicInfo/getInfo
-// changed from a plain string to an options object: { client: 'ANDROID' }.
-// Passing a bare string silently falls back to the WEB client (which hits the
-// login-required wall on datacenter IPs), so every call must use the object form.
-let yt = null;
-
-async function getYT() {
-  if (yt) return yt;
-  yt = await Innertube.create({
-    retrieve_player:          true,
-    generate_session_locally: true,
-  });
-  return yt;
-}
-
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -48,14 +49,6 @@ function isYouTubeUrl(url) {
     const u = new URL(url);
     return /^(www\.)?(youtube\.com|youtu\.be)$/.test(u.hostname);
   } catch { return false; }
-}
-
-function extractVideoId(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split('?')[0];
-    return u.searchParams.get('v');
-  } catch { return null; }
 }
 
 function safeFilename(title) {
@@ -70,42 +63,42 @@ function cleanup(filePath) {
   if (filePath) fs.unlink(filePath, () => {});
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return '';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  return `${m}:${String(s).padStart(2,'0')}`;
-}
-
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // GET /info?url=...
+// Uses `yt-dlp --dump-json` — fast, no download, returns full metadata
 app.get('/info', async (req, res) => {
   const { url } = req.query;
   if (!url || !isYouTubeUrl(url))
     return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
 
-  const videoId = extractVideoId(url);
-  if (!videoId)
-    return res.status(400).json({ error: 'Could not extract video ID from URL.' });
-
   try {
-    const youtube = await getYT();
-    // Object form required in youtubei.js v11+
-    const info    = await youtube.getBasicInfo(videoId, { client: 'ANDROID' });
-    const details = info.basic_info;
+    const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    const thumbs = details.thumbnail || [];
-    const thumb  = thumbs.sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || '';
+    // --dump-json prints one JSON object to stdout then exits — very fast
+    const info = await ytdlp.getVideoInfo(url);
+
+    const thumb = (info.thumbnails || [])
+      .sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)))[0]
+      ?.url || info.thumbnail || '';
+
+    const duration = info.duration
+      ? (() => {
+          const s = Math.round(info.duration);
+          const h = Math.floor(s / 3600);
+          const m = Math.floor((s % 3600) / 60);
+          const sec = s % 60;
+          if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+          return `${m}:${String(sec).padStart(2,'0')}`;
+        })()
+      : '';
 
     return res.json({
-      title:           details.title  || '',
+      title:           info.title || '',
       thumbnail:       thumb,
-      duration_string: formatDuration(details.duration),
-      uploader:        details.author || '',
+      duration_string: duration,
+      uploader:        info.uploader || info.channel || '',
     });
   } catch (e) {
     console.error('[info error]', e.message);
@@ -114,63 +107,36 @@ app.get('/info', async (req, res) => {
 });
 
 // GET /download?url=...&title=...
+// Uses `yt-dlp -x --audio-format mp3` — extracts audio and converts via ffmpeg
 app.get('/download', async (req, res) => {
   const { url, title } = req.query;
   if (!url || !isYouTubeUrl(url))
     return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
 
-  const videoId = extractVideoId(url);
-  if (!videoId)
-    return res.status(400).json({ error: 'Could not extract video ID from URL.' });
-
   const id       = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const rawPath  = path.join(os.tmpdir(), `${id}.webm`);
   const mp3Path  = path.join(os.tmpdir(), `${id}.mp3`);
   const filename = safeFilename(title || id);
 
   console.log(`[download] start "${filename}"`);
 
   try {
-    const youtube = await getYT();
+    const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    // client must be in the options object (not a bare string) for v11+
-    const stream = await youtube.download(videoId, {
-      type:    'audio',
-      quality: 'best',
-      format:  'any',
-      client:  'ANDROID',
-    });
-
-    // youtubei.js returns a web ReadableStream — use for-await, not .pipe()
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(rawPath);
-      (async () => {
-        try {
-          for await (const chunk of stream) file.write(chunk);
-          file.end();
-        } catch (err) { file.destroy(err); }
-      })();
-      file.on('finish', resolve);
-      file.on('error', reject);
-    });
-
-    // Convert webm/opus → mp3 via ffmpeg
-    await new Promise((resolve, reject) => {
-      const proc = spawn(app.locals.ffmpegPath, [
-        '-y', '-i', rawPath,
-        '-vn', '-acodec', 'libmp3lame', '-q:a', '0',
-        mp3Path,
-      ]);
-      let stderr = '';
-      proc.stderr.on('data', (d) => (stderr += d));
-      proc.on('close', (code) => {
-        if (code !== 0) reject(new Error(stderr.slice(-300)));
-        else resolve();
-      });
-      proc.on('error', reject);
-    });
-
-    cleanup(rawPath);
+    // yt-dlp flags:
+    //   -x                   extract audio only
+    //   --audio-format mp3   convert to mp3
+    //   --audio-quality 0    best VBR quality
+    //   --ffmpeg-location    point to bundled ffmpeg
+    //   -o                   output path (without .mp3 suffix — yt-dlp adds it)
+    await ytdlp.execPromise([
+      url,
+      '-x',
+      '--audio-format', 'mp3',
+      '--audio-quality', '0',
+      '--ffmpeg-location', path.dirname(app.locals.ffmpegPath),
+      '--no-playlist',
+      '-o', path.join(os.tmpdir(), `${id}.%(ext)s`),
+    ]);
 
     if (!fs.existsSync(mp3Path))
       return res.status(500).json({ error: 'Conversion produced no output file.' });
@@ -191,7 +157,6 @@ app.get('/download', async (req, res) => {
 
     console.log(`[download] serving "${filename}" (${(stat.size / 1e6).toFixed(1)} MB)`);
   } catch (e) {
-    cleanup(rawPath);
     cleanup(mp3Path);
     console.error('[download error]', e.message);
     if (!res.headersSent) res.status(500).json({ error: e.message || 'Download failed.' });
@@ -201,15 +166,12 @@ app.get('/download', async (req, res) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
   app.locals.ffmpegPath = await resolveFfmpeg();
-  console.log('☕  Starting yt-mp3…');
+  app.locals.ytdlpPath  = await ensureYtDlp();
+
   console.log('ffmpeg:', app.locals.ffmpegPath);
+  console.log('yt-dlp:', app.locals.ytdlpPath);
 
-  // Bind port first so Render sees it immediately, warm up in background
   app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
-
-  getYT()
-    .then(() => console.log('✅ youtubei.js ready'))
-    .catch((err) => console.error('⚠️  youtubei.js warm-up failed:', err.message));
 }
 
 start().catch((err) => {
