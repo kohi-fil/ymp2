@@ -5,7 +5,8 @@ import os      from 'os';
 import https   from 'https';
 import { fileURLToPath } from 'url';
 import { spawn }         from 'child_process';
-import YTDlpWrap         from 'yt-dlp-wrap';
+import YTDlpWrapModule from 'yt-dlp-wrap';
+const YTDlpWrap = YTDlpWrapModule.default ?? YTDlpWrapModule;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
