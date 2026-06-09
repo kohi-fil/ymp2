@@ -78,6 +78,35 @@ function cleanup(p) { if (p) fs.unlink(p, () => {}); }
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// GET /info?url=...
+app.get('/info', async (req, res) => {
+  const { url } = req.query;
+  if (!url || !isYouTubeUrl(url))
+    return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
+
+  try {
+    const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
+
+    const raw = await ytdlp.execPromise([
+      url,
+      '--dump-json',
+      '--no-playlist',
+      '--extractor-args', 'youtube:player_client=tv',
+    ]);
+
+    const info = JSON.parse(raw);
+    res.json({
+      title:           info.title           || '',
+      thumbnail:       info.thumbnail       || '',
+      duration_string: info.duration_string || '',
+      uploader:        info.uploader        || '',
+    });
+  } catch (e) {
+    console.error('[info error]', e.message);
+    res.status(500).json({ error: e.message || 'Could not fetch video info.' });
+  }
+});
+
 // GET /download?url=...
 app.get('/download', async (req, res) => {
   const { url } = req.query;
