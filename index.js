@@ -10,26 +10,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ── ffmpeg path ───────────────────────────────────────────────────────────────
+// Render has ffmpeg natively; ffmpeg-static is optional for local dev.
+async function resolveFfmpeg() {
+  try {
+    const mod = await import('ffmpeg-static');
+    return mod.default;
+  } catch {
+    return 'ffmpeg'; // system ffmpeg (available on Render)
+  }
+}
+
 // ── youtubei.js client (created once at startup) ──────────────────────────────
 let yt = null;
 async function getYT() {
   if (!yt) yt = await Innertube.create({ retrieve_player: true });
   return yt;
 }
-
-// ── ffmpeg: use ffmpeg-static if available, fall back to system ffmpeg ─────────
-function getFfmpeg() {
-  try {
-    const { default: p } = await import('ffmpeg-static');
-    return p;
-  } catch { return 'ffmpeg'; }
-}
-// resolve synchronously at startup via dynamic import workaround
-let ffmpegPath = 'ffmpeg';
-try {
-  const mod = await import('ffmpeg-static');
-  ffmpegPath = mod.default;
-} catch { /* use system ffmpeg */ }
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
@@ -62,6 +59,15 @@ function cleanup(filePath) {
   if (filePath) fs.unlink(filePath, () => {});
 }
 
+function formatDuration(seconds) {
+  if (!seconds) return '';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -81,10 +87,10 @@ app.get('/info', async (req, res) => {
     const details = info.basic_info;
 
     res.json({
-      title:           details.title            || '',
-      thumbnail:       details.thumbnail?.[0]?.url || '',
+      title:           details.title                || '',
+      thumbnail:       details.thumbnail?.[0]?.url  || '',
       duration_string: formatDuration(details.duration),
-      uploader:        details.author            || '',
+      uploader:        details.author               || '',
     });
   } catch (e) {
     console.error('[info error]', e.message);
@@ -103,7 +109,7 @@ app.get('/download', async (req, res) => {
     return res.status(400).json({ error: 'Could not extract video ID from URL.' });
 
   const id      = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const rawPath = path.join(os.tmpdir(), `${id}.webm`);  // audio stream from YT is webm/opus
+  const rawPath = path.join(os.tmpdir(), `${id}.webm`);
   const mp3Path = path.join(os.tmpdir(), `${id}.mp3`);
   const filename = safeFilename(title || id);
 
@@ -111,10 +117,9 @@ app.get('/download', async (req, res) => {
 
   try {
     const youtube = await getYT();
-    const info    = await youtube.getInfo(videoId);
 
-    // Stream the best audio-only format to a temp file
-    const stream  = await youtube.download(videoId, {
+    // Stream best audio-only format directly from YouTube's InnerTube API
+    const stream = await youtube.download(videoId, {
       type:    'audio',
       quality: 'best',
       format:  'any',
@@ -128,14 +133,11 @@ app.get('/download', async (req, res) => {
       stream.on('error', reject);
     });
 
-    // Convert to MP3 with ffmpeg
+    // Convert webm/opus → mp3 via ffmpeg
     await new Promise((resolve, reject) => {
-      const proc = spawn(ffmpegPath, [
-        '-y',
-        '-i', rawPath,
-        '-vn',
-        '-acodec', 'libmp3lame',
-        '-q:a', '0',
+      const proc = spawn(app.locals.ffmpegPath, [
+        '-y', '-i', rawPath,
+        '-vn', '-acodec', 'libmp3lame', '-q:a', '0',
         mp3Path
       ]);
       let stderr = '';
@@ -164,7 +166,10 @@ app.get('/download', async (req, res) => {
     const done = () => { if (!cleaned) { cleaned = true; cleanup(mp3Path); } };
     res.on('finish', done);
     res.on('close',  done);
-    fileStream.on('error', (err) => { console.error('[stream error]', err.message); cleanup(mp3Path); });
+    fileStream.on('error', (err) => {
+      console.error('[stream error]', err.message);
+      cleanup(mp3Path);
+    });
 
     console.log(`[download] serving "${filename}" (${(stat.size / 1e6).toFixed(1)} MB)`);
   } catch (e) {
@@ -175,18 +180,19 @@ app.get('/download', async (req, res) => {
   }
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function formatDuration(seconds) {
-  if (!seconds) return '';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  return `${m}:${String(s).padStart(2,'0')}`;
+// ── Start ─────────────────────────────────────────────────────────────────────
+async function start() {
+  app.locals.ffmpegPath = await resolveFfmpeg();
+  console.log('☕  Starting yt-mp3…');
+  console.log('ffmpeg:', app.locals.ffmpegPath);
+
+  await getYT(); // warm up InnerTube session before accepting requests
+  console.log('✅ youtubei.js ready');
+
+  app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-console.log('☕ Initialising youtubei.js…');
-console.log('ffmpeg:', ffmpegPath);
-await getYT(); // warm up the InnerTube session
-app.listen(PORT, () => console.log(`\n☕  Listening on http://localhost:${PORT}\n`));
+start().catch((err) => {
+  console.error('Startup failed:', err);
+  process.exit(1);
+});
