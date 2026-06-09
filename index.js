@@ -1,12 +1,11 @@
 'use strict';
 
-const express  = require('express');
-const path     = require('path');
-const fs       = require('fs');
-const https    = require('https');
+const express   = require('express');
+const path      = require('path');
+const fs        = require('fs');
+const https     = require('https');
 const { spawn } = require('child_process');
-const os       = require('os');
-const ffmpegPath = require('ffmpeg-static');
+const os        = require('os');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -15,10 +14,22 @@ const PORT = process.env.PORT || 3000;
 const BIN_DIR   = path.join(__dirname, 'bin');
 const YTDLP_BIN = path.join(BIN_DIR, 'yt-dlp');
 
+// Use system ffmpeg (available on Render) or fall back to ffmpeg-static if present
+function getFfmpegPath() {
+  try {
+    // Try ffmpeg-static first (works locally)
+    return require('ffmpeg-static');
+  } catch {
+    // Render and most Linux servers have ffmpeg on PATH
+    return 'ffmpeg';
+  }
+}
+const ffmpegPath = getFfmpegPath();
+
 // ── Boot: ensure bin dir exists ───────────────────────────────────────────────
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-// ── yt-dlp auto-download (Linux x64, correct for Render + Codespace) ─────────
+// ── yt-dlp auto-download ──────────────────────────────────────────────────────
 let ytdlpReady = false;
 let ytdlpReadyPromise = null;
 
@@ -80,16 +91,14 @@ function isYouTubeUrl(url) {
   }
 }
 
-// Safe ASCII filename for Content-Disposition
 function safeFilename(title) {
   return (title || 'audio')
-    .replace(/[^\w\s\-().]/g, '')   // strip non-ASCII / special chars
+    .replace(/[^\w\s\-().]/g, '')
     .replace(/\s+/g, '_')
     .slice(0, 80)
     .concat('.mp3');
 }
 
-// Clean up a file silently
 function cleanup(filePath) {
   if (filePath) fs.unlink(filePath, () => {});
 }
@@ -142,7 +151,6 @@ app.get('/info', async (req, res) => {
 });
 
 // GET /download?url=...&title=...  →  streams MP3 file
-// Frontend passes the title it already fetched from /info so we don't need a second yt-dlp call.
 app.get('/download', async (req, res) => {
   const { url, title } = req.query;
   if (!url || !isYouTubeUrl(url))
@@ -160,7 +168,7 @@ app.get('/download', async (req, res) => {
     '--no-warnings',
     '--no-update',
     '--extractor-args', 'youtube:player_client=android',
-    '--ffmpeg-location', ffmpegPath,   // use ffmpeg-static binary — no apt-get needed
+    '--ffmpeg-location', ffmpegPath,
     '-x',
     '--audio-format', 'mp3',
     '--audio-quality', '0',
@@ -168,7 +176,7 @@ app.get('/download', async (req, res) => {
     url
   ];
 
-  console.log(`[download] start "${filename}"`);
+  console.log(`[download] start "${filename}" | ffmpeg: ${ffmpegPath}`);
 
   const proc = spawn(YTDLP_BIN, args);
   let stderr = '';
@@ -196,7 +204,6 @@ app.get('/download', async (req, res) => {
     const stream = fs.createReadStream(outPath);
     stream.pipe(res);
 
-    // Clean up once — both 'finish' and 'close' can fire; guard against double-delete
     let cleaned = false;
     const done = () => { if (!cleaned) { cleaned = true; cleanup(outPath); } };
     res.on('finish', done);
