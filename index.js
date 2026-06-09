@@ -12,10 +12,32 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── yt-dlp binary ─────────────────────────────────────────────────────────────
-// Auto-download the yt-dlp binary into bin/ on first start (Linux/macOS).
-// On Windows, yt-dlp-wrap falls back to the system PATH automatically.
-const BIN_DIR     = path.join(__dirname, 'bin');
-const YTDLP_PATH  = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const BIN_DIR    = path.join(__dirname, 'bin');
+const YTDLP_PATH = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+
+// Download yt-dlp directly from GitHub releases, following redirects.
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    const get = (u) => https.get(u, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return get(res.headers.location);
+      }
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(dest, () => {});
+        return reject(new Error(`HTTP ${res.statusCode} downloading yt-dlp`));
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    }).on('error', (err) => {
+      file.close();
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+    get(url);
+  });
+}
 
 async function ensureYtDlp() {
   if (fs.existsSync(YTDLP_PATH)) {
@@ -24,7 +46,13 @@ async function ensureYtDlp() {
   }
   fs.mkdirSync(BIN_DIR, { recursive: true });
   console.log('Downloading yt-dlp binary…');
-  await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
+
+  const asset = process.platform === 'win32' ? 'yt-dlp.exe'
+              : process.platform === 'darwin' ? 'yt-dlp_macos'
+              : 'yt-dlp';  // linux
+
+  const url = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}`;
+  await downloadFile(url, YTDLP_PATH);
   fs.chmodSync(YTDLP_PATH, 0o755);
   console.log('✅ yt-dlp downloaded to', YTDLP_PATH);
   return YTDLP_PATH;
@@ -67,7 +95,6 @@ function cleanup(filePath) {
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // GET /info?url=...
-// Uses `yt-dlp --dump-json` — fast, no download, returns full metadata
 app.get('/info', async (req, res) => {
   const { url } = req.query;
   if (!url || !isYouTubeUrl(url))
@@ -75,9 +102,7 @@ app.get('/info', async (req, res) => {
 
   try {
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
-
-    // --dump-json prints one JSON object to stdout then exits — very fast
-    const info = await ytdlp.getVideoInfo(url);
+    const info  = await ytdlp.getVideoInfo(url);
 
     const thumb = (info.thumbnails || [])
       .sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)))[0]
@@ -107,7 +132,6 @@ app.get('/info', async (req, res) => {
 });
 
 // GET /download?url=...&title=...
-// Uses `yt-dlp -x --audio-format mp3` — extracts audio and converts via ffmpeg
 app.get('/download', async (req, res) => {
   const { url, title } = req.query;
   if (!url || !isYouTubeUrl(url))
@@ -122,12 +146,6 @@ app.get('/download', async (req, res) => {
   try {
     const ytdlp = new YTDlpWrap(app.locals.ytdlpPath);
 
-    // yt-dlp flags:
-    //   -x                   extract audio only
-    //   --audio-format mp3   convert to mp3
-    //   --audio-quality 0    best VBR quality
-    //   --ffmpeg-location    point to bundled ffmpeg
-    //   -o                   output path (without .mp3 suffix — yt-dlp adds it)
     await ytdlp.execPromise([
       url,
       '-x',
